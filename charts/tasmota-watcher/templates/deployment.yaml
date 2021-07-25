@@ -27,6 +27,7 @@ spec:
       containers:
         - name: {{ .Chart.Name }}
           command:
+            - 'tasmota-watcher'
             - '--hass_host=$HASS_HOST'
             - '--hass_token=$HASS_TOKEN'
           securityContext:

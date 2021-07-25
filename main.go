@@ -37,7 +37,7 @@ func main() {
 	// open our connection
 	conn, _, err = websocket.DefaultDialer.Dial(fmt.Sprintf("wss://%s/api/websocket", hassHost), nil)
 	if err != nil {
-		logrus.Fatal("failed to connect to websocket")
+		logrus.Fatalf("failed to connect to websocket: %s", err.Error())
 	}
 	defer func() { _ = conn.Close() }()
 

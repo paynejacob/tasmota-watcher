@@ -1,0 +1,11 @@
+set -x
+
+VERSION=$(git tag | grep ^v | sort -V | tail -n 1)
+
+mkdir -p dist
+
+GOOS=linux GOARCH=arm go build -a -o dist/tasmota-watcher-$VERSION-arm64 main.go
+GOOS=linux GOARCH=amd64 go build -a -o dist/tasmota-watcher-$VERSION-amd64 main.go
+GOOS=windows go build -a -o dist/tasmota-watcher-$VERSION-win.exe main.go
+
+helm package charts/tasmota-watcher -d dist

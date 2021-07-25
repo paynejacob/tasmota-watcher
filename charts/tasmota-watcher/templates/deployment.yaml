@@ -27,9 +27,11 @@ spec:
       containers:
         - name: {{ .Chart.Name }}
           command:
-            - 'tasmota-watcher'
-            - '--hass_host=$HASS_HOST'
-            - '--hass_token=$HASS_TOKEN'
+            - "tasmota-watcher"
+            - "--hass_host"
+            - "$(HASS_HOST)"
+            - "--hass_token"
+            - "$(HASS_TOKEN)"
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

@@ -32,8 +32,6 @@ func main() {
 	flag.StringVar(&hassToken, "hass_token", "", "home assistant access token")
 	flag.Parse()
 
-	logrus.SetLevel(logrus.DebugLevel)
-
 	// open our connection
 	conn, _, err = websocket.DefaultDialer.Dial(fmt.Sprintf("wss://%s/api/websocket", hassHost), nil)
 	if err != nil {

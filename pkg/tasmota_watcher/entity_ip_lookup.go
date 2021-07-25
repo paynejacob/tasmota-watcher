@@ -100,7 +100,7 @@ func (r *EntityIPLookup) RestartEntityDevice(entityId string) {
 	// request a restart
 	resp, err := http.Get(u.String())
 	if err != nil || resp.StatusCode != 200 {
-		logrus.Errorf("failed to restart device for entity [%s]: %d -> %s", entityId, resp.StatusCode, err.Error())
+		logrus.Errorf("failed to restart device for entity [%s]: %s", entityId, err.Error())
 		return
 	}
 

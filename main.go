@@ -2,25 +2,19 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 	"main/pkg/tasmota_watcher"
-	"net/http"
-	"net/url"
-	"strings"
+	"net"
 	"time"
 )
 
 var hassHost string
 var hassToken string
-
-const (
-	entityListResultId = iota + 1
-	eventSubscribeResultId
-	getStatesResultId
-)
+var debug bool
 
 func main() {
 	var err error
@@ -30,84 +24,121 @@ func main() {
 	// read in configuration
 	flag.StringVar(&hassHost, "hass_host", "", "home name of the target home assistant")
 	flag.StringVar(&hassToken, "hass_token", "", "home assistant access token")
+	flag.BoolVar(&debug, "debug", false, "enable debug logs")
 	flag.Parse()
 
-	// open our connection
-	conn, _, err = websocket.DefaultDialer.Dial(fmt.Sprintf("wss://%s/api/websocket", hassHost), nil)
-	if err != nil {
-		logrus.Fatalf("failed to connect to websocket: %s", err.Error())
+	if debug {
+		logrus.SetLevel(logrus.DebugLevel)
 	}
-	defer func() { _ = conn.Close() }()
 
-	// request state refresh on an interval to ensure we never stop trying to restart
-	go refreshStateInterval(conn)
+	_, err = newConnection(hassHost, hassToken)
+	if err != nil {
+		logrus.Fatalf("failed to establish connection: %s", err.Error())
+	}
 
-	// consume messages
-	var data []byte
-	var message tasmota_watcher.Message
+	// Start the main loop
 	for {
-		_, data, err = conn.ReadMessage()
+		conn, err = newConnection(hassHost, hassToken)
+		if err != nil {
+			logrus.Error("failed to connect to home assistant, retrying...")
+			logrus.Debugf("connection error: %s", err.Error())
+			<- time.NewTimer(60 * time.Second).C
+			continue
+		}
+
+		logrus.Infof("connection to %s established", hassHost)
+
+		logrus.Debug("initializing lookup tables")
+		err = entityIPLookup.InitializeLookups(conn)
+		if err != nil {
+			logrus.Debugf("failed to initialized entity lookups: %s", err.Error())
+			continue
+		}
+
+		logrus.Debug("requesting initial entity state")
+		err = tasmota_watcher.SendMessage(conn, "get_states", &tasmota_watcher.Message{Id: tasmota_watcher.GetStatesResultId})
+		if err != nil {
+			logrus.Debugf("failed to refresh states: %s", err.Error())
+			continue
+		}
+
+		logrus.Debug("watching for state changes")
+		err = tasmota_watcher.SendMessage(conn, "subscribe_events", &tasmota_watcher.SubscribeEvents{Id: tasmota_watcher.EventSubscribeResultId, EventType: "state_changed"})
+		if err != nil {
+			logrus.Debugf("failed to subscribe to events: %s", err.Error())
+			continue
+		}
+
+		var data []byte
+		var message tasmota_watcher.ResultResponse
+		for {
+			_, data, err = conn.ReadMessage()
+			if err != nil {
+				logrus.Debugf("failed to read message: %s", err.Error())
+				break
+			}
+
+			if json.Unmarshal(data, &message) != nil {
+				logrus.Debugf("received non json message: %s", data)
+				break
+			}
+
+			switch message.Type {
+			case "event":
+				go processStateChange(&entityIPLookup, data)
+				break
+			case "result":
+				switch message.Id {
+				case tasmota_watcher.EventSubscribeResultId:
+					if !message.Success {
+						logrus.Debugf("failed to subscribe to event updates: %s", message.Error)
+					}
+				case tasmota_watcher.GetStatesResultId:
+					ProcessStateList(&entityIPLookup, data)
+					break
+				}
+			}
+
+		}
+
+		logrus.Warning("connection lost")
+	}
+}
+
+func authenticateConnection(conn *websocket.Conn, hassToken string) error {
+	var err error
+	var message tasmota_watcher.Message
+
+	err = tasmota_watcher.SendMessage(conn, "auth", &tasmota_watcher.AuthMessage{AccessToken: hassToken})
+	if err != nil {
+		return err
+	}
+
+	for {
+		err = conn.ReadJSON(&message)
 		if err != nil {
 			logrus.Fatal("failed to read websocket message")
 		}
 
-		if json.Unmarshal(data, &message) != nil {
-			logrus.Warnf("received non json message: %s", data)
+		if message.Type == "auth_invalid" {
+			return errors.New("invalid home assistant token")
 		}
 
-		switch message.Type {
-
-		// hass is ready to talk and we can authenticate
-		case "auth_required":
-			if tasmota_watcher.SendMessage(conn, "auth", &tasmota_watcher.AuthMessage{AccessToken: hassToken}) != nil {
-				logrus.Fatal("failed to write message")
-			}
-			break
-
-		// we are authenticated and can hydrate our entity ip lookup
-		case "auth_ok":
-			logrus.Infof("listening for events from [%s]", hassHost)
-
-			if tasmota_watcher.SendMessage(conn, "config/entity_registry/list", &tasmota_watcher.ResultRequest{Id: entityListResultId}) != nil {
-				logrus.Fatal("failed to write message")
-			}
-			break
-
-		// bad token, this is unrecoverable
-		case "auth_invalid":
-			logrus.Fatal("invalid access token")
-
-		// a state change has occurred
-		case "event":
-			go processStateChange(&entityIPLookup, data)
-			break
-
-		// our entity list is ready and we can hydrate our lookup
-		case "result":
-			switch message.Id {
-			case getStatesResultId:
-				ProcessStateList(&entityIPLookup, hassHost, hassToken, data)
-				break
-			case entityListResultId:
-				processEntityList(&entityIPLookup, data)
-
-				// now that our lookup is populated we can start listening to events and get an intial state
-				if tasmota_watcher.SendMessage(conn, "subscribe_events", &tasmota_watcher.SubscribeEvents{Id: eventSubscribeResultId, EventType: "state_changed"}) != nil {
-					logrus.Fatal("failed to write message")
-				}
-				break
-			}
-			break
+		if message.Type == "auth_ok" {
+			return nil
 		}
 	}
 }
 
-func refreshStateInterval(conn *websocket.Conn) {
-	for range time.NewTicker(5 * time.Minute).C {
-		if tasmota_watcher.SendMessage(conn, "get_states", &tasmota_watcher.Message{Id: getStatesResultId}) != nil {
-			logrus.Error("failed to refresh states")
-		}
+func newConnection(hassHost, hassToken string) (conn *websocket.Conn, err error) {
+	conn, _, err = websocket.DefaultDialer.Dial(fmt.Sprintf("wss://%s/api/websocket", hassHost), nil)
+	if err != nil {
+		return
 	}
+
+	err = authenticateConnection(conn, hassToken)
+
+	return
 }
 
 func processStateChange(entityIPLookup *tasmota_watcher.EntityIPLookup, data []byte) {
@@ -119,37 +150,22 @@ func processStateChange(entityIPLookup *tasmota_watcher.EntityIPLookup, data []b
 		return
 	}
 
-	if isIPSensorEntity(message.Event.Data.EntityId) {
-		if message.Event.Data.NewState.State == "unavailable" {
-			return
+	// an ip address was updated
+	if tasmota_watcher.IsIPSensorEntity(message.Event.Data.EntityId) {
+		// if it is not a valid ip address we don't want to store it
+		if net.ParseIP(message.Event.Data.NewState.State) != nil {
+			entityIPLookup.UpdateIP(message.Event.Data.EntityId, message.Event.Data.NewState.State)
 		}
-
-		entityIPLookup.UpdateIP(message.Event.Data.EntityId, message.Event.Data.NewState.State)
-	} else if isSwitchEntity(message.Event.Data.EntityId) {
+	// an entity state was updated
+	} else if tasmota_watcher.IsSwitchEntity(message.Event.Data.EntityId) {
+		// if the entity has become unavailable we need to restart it
 		if message.Event.Data.NewState.State == "unavailable" {
 			entityIPLookup.RestartEntityDevice(message.Event.Data.EntityId)
 		}
 	}
 }
 
-func processEntityList(entityIPLookup *tasmota_watcher.EntityIPLookup, data []byte) {
-	var message tasmota_watcher.EntityListResult
-
-	if json.Unmarshal(data, &message) != nil {
-		logrus.Errorf("failed to parse entity list: %s", data)
-		return
-	}
-
-	for i := 0; i < len(message.Result); i++ {
-		if isIPSensorEntity(message.Result[i].EntityId) {
-			entityIPLookup.BindDeviceSensor(message.Result[i].DeviceId, message.Result[i].EntityId)
-		} else if isSwitchEntity(message.Result[i].EntityId) {
-			entityIPLookup.BindDeviceEntity(message.Result[i].DeviceId, message.Result[i].EntityId)
-		}
-	}
-}
-
-func ProcessStateList(entityIPLookup *tasmota_watcher.EntityIPLookup, hassHost, hassToken string, data []byte) {
+func ProcessStateList(entityIPLookup *tasmota_watcher.EntityIPLookup, data []byte) {
 	var message tasmota_watcher.StateListResult
 
 	if json.Unmarshal(data, &message) != nil {
@@ -157,93 +173,20 @@ func ProcessStateList(entityIPLookup *tasmota_watcher.EntityIPLookup, hassHost, 
 		return
 	}
 
-	switchEntites := map[string]string{} // entity id to state
-
 	for i := 0; i < len(message.Result); i++ {
-
-		if isIPSensorEntity(message.Result[i].EntityId) {
-			fakeEvent := tasmota_watcher.Event{}
-			fakeEvent.Event.Data.EntityId = message.Result[i].EntityId
-			fakeEvent.Event.Data.NewState.State = message.Result[i].State
-
-			if fakeEvent.Event.Data.NewState.State == "unavailable" {
-				var err error
-				fakeEvent.Event.Data.NewState.State, err = getLastKnownIP(message.Result[i].EntityId, hassHost, hassToken)
-				if err != nil || fakeEvent.Event.Data.NewState.State == "" {
-					logrus.Warningf("unable to find ip address for sensor [%s]", message.Result[i].EntityId)
-					continue
-				}
+		if tasmota_watcher.IsIPSensorEntity(message.Result[i].EntityId) {
+			if net.ParseIP(message.Result[i].State) != nil {
+				entityIPLookup.UpdateIP(message.Result[i].EntityId, message.Result[i].State)
 			}
 
-			fakeData, _ := json.Marshal(fakeEvent)
-
-			processStateChange(entityIPLookup, fakeData)
-		} else if isSwitchEntity(message.Result[i].EntityId) {
-			switchEntites[message.Result[i].EntityId] = message.Result[i].State
-		}
-	}
-
-	for entityId, state := range switchEntites {
-		fakeEvent := tasmota_watcher.Event{}
-		fakeEvent.Event.Data.EntityId = entityId
-		fakeEvent.Event.Data.NewState.State = state
-
-		fakeData, _ := json.Marshal(fakeEvent)
-
-		go processStateChange(entityIPLookup, fakeData)
-	}
-
-}
-
-func getLastKnownIP(sensorId, hassHost, hassToken string) (string, error) {
-	u := &url.URL{
-		Scheme: "https",
-		Host:   hassHost,
-		Path:   fmt.Sprintf("/api/history/period/%s", (time.Now().UTC().AddDate(0, -3, 0)).Format(time.RFC3339)),
-	}
-
-	q := u.Query()
-	q.Set("filter_entity_id", sensorId)
-	q.Set("minimal_response", "")
-	q.Set("end_time", time.Now().UTC().Format(time.RFC3339))
-	u.RawQuery = q.Encode()
-
-	req := &http.Request{
-		Method: http.MethodGet,
-		URL:    u,
-		Header: map[string][]string{"Authorization": {fmt.Sprintf("Bearer %s", hassToken)}},
-	}
-	client := http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-
-	var body []interface{}
-
-	err = json.NewDecoder(resp.Body).Decode(&body)
-	if err != nil {
-		return "", err
-	}
-
-	for _, entityResult := range body {
-		if states, ok := entityResult.([]interface{}); ok {
-			for _, state := range states {
-				entityState, _ := state.(map[string]interface{})
-				if val, ok := entityState["state"].(string); ok && val != "unavailable" {
-					return val, nil
-				}
+		} else if tasmota_watcher.IsSwitchEntity(message.Result[i].EntityId) {
+			if message.Result[i].State == "unavailable" {
+				// defer switch entities incase their ip entry is new
+				entityId := message.Result[i].EntityId
+				defer func() {
+					go entityIPLookup.RestartEntityDevice(entityId)
+				}()
 			}
 		}
 	}
-
-	return "", nil
-}
-
-func isIPSensorEntity(entityId string) bool {
-	return strings.HasPrefix(entityId, "sensor.") && strings.Contains(entityId, "_ip")
-}
-
-func isSwitchEntity(entityId string) bool {
-	return strings.HasPrefix(entityId, "light.") || strings.HasPrefix(entityId, "switch.")
 }

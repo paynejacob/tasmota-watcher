@@ -52,6 +52,7 @@ type ResultResponse struct {
 
 	Id      int  `json:"id"`
 	Success bool `json:"success"`
+	Error string `json:"error"`
 }
 
 type EntityListResult struct {

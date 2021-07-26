@@ -1,6 +1,8 @@
 package tasmota_watcher
 
 import (
+	"errors"
+	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 	"net/http"
 	"net/url"
@@ -25,6 +27,44 @@ func NewEntityIPLookup() EntityIPLookup {
 		iPSensorDeviceLookup: map[string]string{},
 		entityDeviceLookup:   map[string]string{},
 	}
+}
+
+func (r *EntityIPLookup) InitializeLookups(conn *websocket.Conn) error {
+	var err error
+	var message EntityListResult
+
+	err = SendMessage(conn, "config/entity_registry/list", &ResultRequest{Id: EntityListResultId})
+	if err != nil {
+		return err
+	}
+
+	for {
+		err = conn.ReadJSON(&message)
+		if err != nil {
+			return err
+		}
+
+		if message.Id == EntityListResultId {
+			break
+		}
+	}
+
+	if !message.Success {
+		return errors.New(message.Error)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i := 0; i < len(message.Result); i++ {
+		if IsIPSensorEntity(message.Result[i].EntityId) {
+			r.iPSensorDeviceLookup[message.Result[i].EntityId] = message.Result[i].DeviceId
+		} else if IsSwitchEntity(message.Result[i].EntityId) {
+			r.entityDeviceLookup[message.Result[i].EntityId] = message.Result[i].DeviceId
+		}
+	}
+
+	return nil
 }
 
 func (r *EntityIPLookup) UpdateIP(sensorId, ip string) {
@@ -64,14 +104,14 @@ func (r *EntityIPLookup) RestartEntityDevice(entityId string) {
 	// get the associated device
 	deviceId, found = r.entityDeviceLookup[entityId]
 	if !found {
-		logrus.Errorf("cannot determine device id for entity [%s]", entityId)
+		logrus.Warnf("cannot determine device id for entity [%s]", entityId)
 		return
 	}
 
 	// get the device ip
 	deviceIP, found = r.deviceIPLookup[deviceId]
 	if !found {
-		logrus.Errorf("cannot determine device ip for entity [%s]", entityId)
+		logrus.Warnf("cannot determine device ip for entity [%s]", entityId)
 		return
 	}
 
@@ -100,7 +140,7 @@ func (r *EntityIPLookup) RestartEntityDevice(entityId string) {
 	// request a restart
 	resp, err := http.Get(u.String())
 	if err != nil || resp.StatusCode != 200 {
-		logrus.Errorf("failed to restart device for entity [%s]: %s", entityId, err.Error())
+		logrus.Warnf("failed to restart device for entity [%s]: %s", entityId, err.Error())
 		return
 	}
 
